@@ -1,0 +1,278 @@
+<!-- =========================================================================
+     PHASE 1: BASELINE SECURITY & ACCESS CONTROL
+     FIXED: All rules validated against Wazuh 4.14.5 documentation
+     CHANGES IN THIS VERSION:
+       - Rule 100300: Changed if_matched_group to if_matched_sid for reliability
+         (Wazuh bug #3291/#3844 - if_matched_group is inconsistent)
+     ========================================================================= -->
+<group name="local,syslog,sshd,">
+  <rule id="100001" level="5">
+    <if_sid>5716,5710,5712,5760</if_sid>
+    <description>sshd: authentication failed.</description>
+    <group>authentication_failed,pci_dss_10.2.4,pci_dss_10.2.5,</group>
+  </rule>
+  <!-- 2. SSH Brute Force -->
+  <rule id="100003" level="15" frequency="4" timeframe="60">
+    <if_matched_sid>100001</if_matched_sid>
+    <same_source_ip />
+    <description>Custom: 4 Failed SSH Attempts within 60s</description>
+    <mitre>
+      <id>T1110</id>
+    </mitre>
+  </rule>
+  
+  <!-- 4. Direct Root Login -->
+  <rule id="100007" level="12">
+    <if_sid>5715</if_sid>
+    <user>^root$</user>
+    <description>Suspicious: Direct root login via SSH detected</description>
+    <mitre>
+      <id>T1078</id>
+    </mitre>
+  </rule>
+</group>
+<group name="windows,">
+  <!-- 5. Windows Logon Failures -->
+  <!-- FIXED: Changed from if_matched_group (buggy) to if_matched_sid>60122
+       Wazuh bug #3291/#3844: if_matched_group is inconsistent across multiple
+       rule definitions. Rule 60122 matches EventID 4625 (unknown user/bad password)
+       which is the definitive brute-force indicator.
+       
+       Test: Paste Windows auth failure JSON 5 times in same logtest session -->
+  <rule id="100300" level="10" frequency="5" timeframe="120">
+    <if_matched_sid>60122</if_matched_sid>
+    <same_field>win.eventdata.ipAddress</same_field>
+    <description>Multiple Windows Logon Failures (Block after 5)</description>
+    <options>no_full_log</options>
+    <group>authentication_failures,pci_dss_10.2.4,pci_dss_10.2.5,pci_dss_11.4,gdpr_IV_35.7.d,gdpr_IV_32.2,hipaa_164.312.b,nist_800_53_AU.14,nist_800_53_AC.7,nist_800_53_SI.4,</group>
+  </rule>
+  <!-- 6. Success after Windows Brute Force -->
+  <!-- Uses 60106 (Windows logon success) + 100300 (our custom failure count) -->
+  <rule id="100005" level="15">
+    <if_sid>60106,92652</if_sid>
+    <if_matched_sid>100300</if_matched_sid>
+    <same_field>win.eventdata.ipAddress</same_field>
+    <description>Critical: Windows Login Success after High Volume of Failures</description>
+    <mitre>
+      <id>T1110</id>
+    </mitre>
+  </rule>
+</group>
+<!-- =========================================================================
+     PHASE 2: INTEGRATIONS & THREAT INTELLIGENCE
+     ========================================================================= -->
+<group name="attack,">
+  <!-- 8. AlienVault Malicious IP -->
+  <rule id="100100" level="10">
+    <if_group>web|attack</if_group>
+    <list field="srcip" lookup="address_match_key">etc/lists/blacklist-alienvault</list>
+    <description>IP address found in AlienVault reputation database.</description>
+    <mitre>
+      <id>T1071</id>
+    </mitre>
+  </rule>
+</group>
+<group name="virustotal,">
+  <!-- 9. VirusTotal Remediation Success/Fail -->
+  <rule id="100092" level="12">
+    <if_sid>657</if_sid>
+    <match>Successfully removed threat</match>
+    <description>$(parameters.program) removed threat located at $(parameters.alert.data.virustotal.source.file)</description>
+  </rule>
+  <rule id="100093" level="12">
+    <if_sid>657</if_sid>
+    <match>Error removing threat</match>
+    <description>Error removing threat located at $(parameters.alert.data.virustotal.source.file)</description>
+  </rule>
+</group>
+<!-- =========================================================================
+     PHASE 3: WEB ATTACKS & ANOMALIES
+     ========================================================================= -->
+<group name="web,dos,">
+  <!-- 10. Ignored Web URLs -->
+  <rule id="31108" level="3" overwrite="yes">
+    <if_sid>31100</if_sid>
+    <id>^2|^3</id>
+    <compiled_rule>is_simple_http_request</compiled_rule>
+    <url>^/$|^/index.php|^/index.html</url>
+    <description>Ignored URLs (Modified to Level 3)</description>
+  </rule>
+  <!-- 11. Web DoS Attack -->
+  <rule id="100010" level="10" frequency="50" timeframe="60" ignore="60">
+    <if_matched_sid>31108</if_matched_sid>
+    <same_source_ip />
+    <description>DoS Attack: High volume of requests to Root/Index</description>
+    <mitre>
+      <id>T1498</id>
+    </mitre>
+  </rule>
+</group>
+<group name="anomaly,">
+  <!-- 12. Off-hours Login -->
+  <rule id="100009" level="10">
+    <if_sid>5715,60106</if_sid>
+    <time>00:00 - 06:00</time>
+    <description>Warning: Successful login detected during non-business hours (Midnight - 6 AM)</description>
+    <mitre>
+      <id>T1078</id>
+    </mitre>
+  </rule>
+</group>
+<!-- =========================================================================
+     PHASE 4: ADVANCED THREAT DETECTION (UEBA, LotL, APTs)
+     ========================================================================= -->
+<group name="ueba,lotl,exfiltration,linux,">
+  <!-- Rule 1: Living off the Land (LotL) - Linux -->
+  <rule id="100020" level="12">
+    <if_group>syslog|audit</if_group>
+    <regex type="pcre2">(curl|wget)\s+https?://\S+\s*\|\s*(bash|sh)\b</regex>
+    <description>UEBA/LotL: Suspicious remote script execution detected (curl/wget piped to bash).</description>
+    <mitre>
+      <id>T1105</id>
+      <id>T1059.004</id>
+    </mitre>
+  </rule>
+  <!-- Rule 2: Data Exfiltration Preparation - Linux -->
+  <rule id="100021" level="12">
+    <if_group>syslog|audit</if_group>
+    <regex type="pcre2">(?i)(tar\s+-c\S*|zip\s+-r\S*|rar\s+a\S*|7z\s+a\S*)\s+\S+\s+(/etc|/var/log|/var/ossec|/root|/var/lib/mysql)</regex>
+    <description>UEBA/Exfiltration: Compression of a sensitive directory detected. Possible data exfiltration preparation.</description>
+    <mitre>
+      <id>T1560</id>
+    </mitre>
+  </rule>
+  <!-- Rule 3: Correlation (The Kill Chain) - Linux -->
+  <rule id="100022" level="15" timeframe="1800">
+    <if_sid>100021</if_sid>
+    <if_matched_sid>100020</if_matched_sid>
+    <description>CRITICAL KILL CHAIN: Suspicious script execution followed by sensitive data archiving. Active breach underway!</description>
+    <mitre>
+      <id>T1105</id>
+      <id>T1560</id>
+    </mitre>
+  </rule>
+  <!-- Rule 4: Fileless Malware Detection (Base64 decoding) - Linux -->
+  <rule id="100024" level="13">
+    <if_group>syslog|audit</if_group>
+    <regex type="pcre2">base64\s+(-d|--decode)\b.*(?:\|\s*(bash|sh)\b|bash\s+-c\b|sh\s+-c\b)</regex>
+    <description>Fileless Malware Alert: Linux executing Base64 encoded payload in memory!</description>
+    <mitre>
+      <id>T1059.004</id>
+      <id>T1027</id>
+    </mitre>
+  </rule>
+</group>
+<group name="windows,powershell,malware,fileless,">
+  <!-- Rule 5: Fileless Malware Detection (PowerShell) - Windows -->
+  <rule id="100023" level="13">
+    <if_group>windows</if_group>
+    <regex type="pcre2">(?i)(FromBase64String|Invoke-WebRequest.*Invoke-Expression|IWR.*IEX|iex.*FromBase64String)</regex>
+    <description>Fileless Malware Alert: PowerShell executing Base64 encoded payload or Remote Download &amp; Execute!</description>
+    <mitre>
+      <id>T1059.001</id>
+      <id>T1027</id>
+      <id>T1105</id>
+    </mitre>
+  </rule>
+</group>
+<!-- =========================================================================
+     SUPPRESSOR: Prevent active-response feedback loops
+     ========================================================================= -->
+<group name="suppressor,">
+  <rule id="100030" level="0">
+    <if_sid>650,651,652</if_sid>
+    <description>Suppressor: Prevent feedback loops from active-response execution logs.</description>
+  </rule>
+</group>
+<!-- =========================================================================
+     PHASE 5: PRIVILEGE ESCALATION, PERSISTENCE & DEFENSE EVASION
+     ========================================================================= -->
+<!-- Sudo failure base rule + frequency correlation -->
+<group name="sudo,authentication,linux,">
+  <rule id="100050" level="5">
+    <if_group>syslog</if_group>
+    <program_name>sudo</program_name>
+    <match>authentication failure</match>
+    <description>Sudo: Authentication failure detected</description>
+  </rule>
+  <rule id="100051" level="10" frequency="3" timeframe="120">
+    <if_matched_sid>100050</if_matched_sid>
+    <same_user />
+    <description>UEBA: Multiple failed sudo attempts - possible privilege escalation</description>
+    <mitre>
+      <id>T1548.003</id>
+    </mitre>
+  </rule>
+</group>
+<!-- Defense evasion - logging service killed -->
+<group name="defense_evasion,linux,">
+  <rule id="100070" level="15">
+    <if_group>syslog|audit</if_group>
+    <regex type="pcre2">(?i)(service\s+(?:auditd|rsyslog|syslog)\s+stop|systemctl\s+(?:stop|disable)\s+(?:auditd|rsyslog))</regex>
+    <description>Defense Evasion: Logging service stopped - possible log tampering</description>
+    <mitre>
+      <id>T1562.001</id>
+    </mitre>
+  </rule>
+</group>
+<!-- =========================================================================
+     DEMO RULE 1: RANSOMWARE MASS ENCRYPTION
+     FIXED: Changed field name from "syscheck.path" to "file" (documented FIM field)
+     ========================================================================= -->
+<group name="syscheck,ransomware,attack,">
+  <!-- Base: single .enc file created/modified -->
+  <rule id="100200" level="7">
+    <if_group>syscheck</if_group>
+    <field name="file" type="pcre2">\.enc$</field>
+    <description>Ransomware Indicator: File encrypted with .enc extension detected</description>
+    <mitre>
+      <id>T1486</id>
+    </mitre>
+  </rule>
+  <!-- Correlation: 10+ .enc files within 60 seconds = CRITICAL -->
+  <rule id="100201" level="15" frequency="10" timeframe="60">
+    <if_matched_sid>100200</if_matched_sid>
+    <description>CRITICAL RANSOMWARE: Mass encryption detected! 10+ .enc files created/modified within 60 seconds.</description>
+    <mitre>
+      <id>T1486</id>
+      <id>T1490</id>
+    </mitre>
+  </rule>
+</group>
+<!-- =========================================================================
+     DEMO RULE 2: WEB SHELL UPLOAD (FIM)
+     FIXED: Changed field name from "syscheck.path" to "file" (documented FIM field)
+     ========================================================================= -->
+<group name="syscheck,webshell,web,attack,">
+  <rule id="100210" level="12">
+    <if_group>syscheck</if_group>
+    <field name="file" type="pcre2">^(/var/www/html|/usr/share/nginx/html|/opt/lampp/htdocs)/.*\.(php|jsp|aspx|py|sh|pl)$</field>
+    <description>Web Shell Upload: Suspicious executable file detected in web server directory</description>
+    <mitre>
+      <id>T1505.003</id>
+    </mitre>
+  </rule>
+</group>
+<!-- =========================================================================
+     DEMO RULE 3: HONEYPOT ACCESS → ACTIVE RESPONSE IP BLOCK
+     FIXED: Split into base rule (100231) + correlation rule (100230)
+     to ensure ONLY honeypot hits are counted (not all web requests)
+     ========================================================================= -->
+<group name="web,attack,active_response,demo,">
+  <!-- Base rule: Honeypot URL accessed (matches on each hit) -->
+  <rule id="100231" level="5">
+    <if_sid>31100</if_sid>
+    <url type="pcre2">honeypot\.txt|trap\.php|secret\.php|admin\.php|shell\.php|backdoor\.php</url>
+    <description>Web: Honeypot URL accessed</description>
+  </rule>
+  <!-- Correlation: 3+ honeypot hits from same IP within 30s triggers firewall block -->
+  <rule id="100230" level="10" frequency="3" timeframe="30">
+    <if_matched_sid>100231</if_matched_sid>
+    <same_source_ip />
+    <description>DEMO: Honeypot Probing Detected — Blocking Source IP via Active Response</description>
+    <mitre>
+      <id>T1204</id>
+      <id>T1046</id>
+    </mitre>
+  </rule>
+</group>
